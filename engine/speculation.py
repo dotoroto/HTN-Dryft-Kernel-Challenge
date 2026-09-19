@@ -5,12 +5,12 @@ MIN_SPECULATIVE_BATCH = 8
 
 
 def prompt_lookup(history: list[int], count: int, max_ngram: int = 16):
-    """Copy tokens following the newest earlier matching suffix."""
+    """Vote on continuations of the longest matching earlier suffix."""
     if count <= 0:
         return []
     size = len(history)
     best_length = 0
-    best = None
+    votes = {}
     # Search candidate suffix ends once rather than repeatedly slicing the
     # entire prompt for each possible n-gram length.
     for end in range(size - count - 1, -1, -1):
@@ -23,12 +23,14 @@ def prompt_lookup(history: list[int], count: int, max_ngram: int = 16):
             and history[end - matched] == history[size - 1 - matched]
         ):
             matched += 1
-        if matched > best_length:
+        if matched >= best_length:
+            if matched > best_length:
+                votes.clear()
             best_length = matched
-            best = history[end + 1 : end + 1 + count]
-            if matched == max_ngram:
-                break
-    return best
+            proposal = tuple(history[end + 1 : end + 1 + count])
+            votes[proposal] = votes.get(proposal, 0) + 1
+    # Dict insertion order keeps the newest match as the tie breaker.
+    return list(max(votes, key=votes.get)) if votes else None
 
 
 def make_speculative_inputs(

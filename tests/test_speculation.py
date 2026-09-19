@@ -18,6 +18,10 @@ def test_prompt_lookup_prefers_longest_recent_suffix():
     assert prompt_lookup([1, 2, 3], 1) is None
 
 
+def test_prompt_lookup_votes_on_equal_length_matches():
+    assert prompt_lookup([5, 7, 5, 7, 5, 8, 5], 1) == [7]
+
+
 def test_bucket_selection_requires_proposals_for_whole_batch():
     histories = [[1, 2, 3, 1]] * 7 + [[7, 8, 7]]
     pending = [1] * 7 + [7]
