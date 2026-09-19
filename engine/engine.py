@@ -11,7 +11,7 @@ from transformers import AutoModelForCausalLM, StaticCache
 from kernels.acceptance import argmax_and_accept
 from kernels.gqa import grouped_query_attention
 from prefill import PromptCache
-from speculation import MIN_SPECULATIVE_BATCH, make_speculative_inputs, resolve_verification
+from speculation import AdaptiveSpeculation, MIN_SPECULATIVE_BATCH, resolve_verification
 
 
 def _rotate_half(value: torch.Tensor) -> torch.Tensor:
@@ -56,6 +56,7 @@ class Engine:
         self.runtime_shape = None
         self.profile_ttft = os.environ.get("DRYFT_PROFILE_TTFT") == "1"
         self.graph_prefill = os.environ.get("DRYFT_PREFILL_GRAPH") == "1"
+        self.profile_speculation = os.environ.get("DRYFT_PROFILE_SPECULATION") == "1"
 
     def _allocate_runtime(self, batch: int, capacity: int) -> None:
         shape = (batch, capacity)
@@ -259,20 +260,29 @@ class Engine:
         pending = first
         cache_length = prompt_length
         produced = 1
+        policy = AdaptiveSpeculation(batch)
         yield first
 
         while produced < max_new_tokens:
             remaining = max_new_tokens - produced
-            query_length, rows = make_speculative_inputs(
+            query_length, rows = policy.inputs(
                 histories, pending, remaining
             )
             targets, matches = self._run_graph(rows, cache_length)
 
             emissions, committed = resolve_verification(rows, targets, matches)
+            policy.observe(query_length, len(emissions))
             for tokens in emissions:
                 for batch_index, token in enumerate(tokens):
                     histories[batch_index].append(token)
                 produced += 1
+                if produced == max_new_tokens and self.profile_speculation:
+                    print(
+                        f"speculation_profile batch={batch}"
+                        f" calls={policy.calls} emitted={policy.emitted}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 yield tokens
             cache_length += committed
             pending = emissions[-1]

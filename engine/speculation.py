@@ -32,13 +32,14 @@ def prompt_lookup(history: list[int], count: int, max_ngram: int = 16):
 
 
 def make_speculative_inputs(
-    histories: list[list[int]], pending: list[int], remaining: int
+    histories: list[list[int]], pending: list[int], remaining: int,
+    max_bucket: int = 4,
 ):
     """Return a K=1 decode below batch eight, otherwise the best bucket."""
     if len(histories) < MIN_SPECULATIVE_BATCH:
         return 1, [[token] for token in pending]
     for bucket in GRAPH_BUCKETS:
-        if bucket > remaining:
+        if bucket > remaining or bucket > max_bucket:
             continue
         count = bucket - 1
         proposals = [prompt_lookup(history, count) for history in histories]
@@ -46,6 +47,52 @@ def make_speculative_inputs(
             rows = [[pending[i], *proposals[i]] for i in range(len(histories))]
             return bucket, rows
     raise RuntimeError("the K=1 fallback must always be available")
+
+
+class AdaptiveSpeculation:
+    """Back off when whole-batch verification rarely advances multiple tokens."""
+
+    def __init__(self, batch: int):
+        self.max_bucket = 4 if batch >= MIN_SPECULATIVE_BATCH else 1
+        self.misses = 0
+        self.k2_successes = 0
+        self.cooldown = 0
+        self.calls = {1: 0, 2: 0, 4: 0}
+        self.emitted = {1: 0, 2: 0, 4: 0}
+
+    def inputs(self, histories, pending, remaining):
+        return make_speculative_inputs(
+            histories, pending, remaining, max_bucket=self.max_bucket
+        )
+
+    def observe(self, bucket: int, output_steps: int) -> None:
+        self.calls[bucket] += 1
+        self.emitted[bucket] += output_steps
+        if self.cooldown:
+            self.cooldown -= 1
+            if not self.cooldown:
+                self.max_bucket = 2
+            return
+        if bucket == 4:
+            self.misses = 0 if output_steps >= 3 else self.misses + 1
+            if self.misses >= 2:
+                self.max_bucket = 2
+                self.misses = 0
+                self.k2_successes = 0
+        elif bucket == 2:
+            if output_steps == 2:
+                self.misses = 0
+                self.k2_successes += 1
+                if self.k2_successes >= 4:
+                    self.max_bucket = 4
+                    self.k2_successes = 0
+            else:
+                self.misses += 1
+                self.k2_successes = 0
+                if self.misses >= 2:
+                    self.max_bucket = 1
+                    self.cooldown = 8
+                    self.misses = 0
 
 
 def resolve_verification(

@@ -5,6 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 
 from speculation import (  # noqa: E402
+    AdaptiveSpeculation,
     make_speculative_inputs,
     prompt_lookup,
     resolve_verification,
@@ -38,6 +39,26 @@ def test_small_batches_never_speculate():
     bucket, rows = make_speculative_inputs(histories, [1] * 7, remaining=4)
     assert bucket == 1
     assert rows == [[1]] * 7
+
+
+def test_adaptive_policy_backs_off_and_reprobes():
+    policy = AdaptiveSpeculation(16)
+    history = [[1, 2, 3, 4, 1, 2, 3, 4, 1]] * 16
+    pending = [1] * 16
+    assert policy.inputs(history, pending, 4)[0] == 4
+    policy.observe(4, 1)
+    policy.observe(4, 1)
+    assert policy.inputs(history, pending, 4)[0] == 2
+    policy.observe(2, 1)
+    policy.observe(2, 1)
+    assert policy.inputs(history, pending, 4)[0] == 1
+    for _ in range(8):
+        policy.observe(1, 1)
+    assert policy.inputs(history, pending, 4)[0] == 2
+    for _ in range(4):
+        policy.observe(2, 2)
+    assert policy.inputs(history, pending, 4)[0] == 4
+    assert policy.calls == {1: 8, 2: 6, 4: 2}
 
 
 def test_full_acceptance_emits_proposals_and_bonus():
