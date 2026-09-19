@@ -60,6 +60,20 @@ class Engine:
         )
         self.runtime_shape = shape
 
+    def _copy_prefill_cache(self, prefill_cache, prompt_length: int) -> None:
+        """Move native prefill's K/V into the fixed-address decode cache.
+
+        Prefilling directly into ``StaticCache`` makes Transformers construct
+        a full-capacity causal mask for every layer. A fresh DynamicCache lets
+        the native SDPA prefill use its fast causal path; only the populated
+        prompt slots are copied, and decode still uses the captured static
+        cache addresses.
+        """
+        for destination, source in zip(self.cache.key_cache, prefill_cache.key_cache):
+            destination[:, :, :prompt_length, :].copy_(source)
+        for destination, source in zip(self.cache.value_cache, prefill_cache.value_cache):
+            destination[:, :, :prompt_length, :].copy_(source)
+
     @torch.inference_mode()
     def _target_forward(
         self, input_ids: torch.Tensor, positions: torch.Tensor
@@ -169,18 +183,15 @@ class Engine:
         self._allocate_runtime(batch, capacity)
 
         prompt = torch.tensor(input_ids, dtype=torch.int64, device=self.device)
-        prompt_positions = torch.arange(
-            prompt_length, dtype=torch.int64, device=self.device
-        )
         output = self.model(
             input_ids=prompt,
-            past_key_values=self.cache,
-            cache_position=prompt_positions,
             use_cache=True,
             logits_to_keep=1,
             return_dict=True,
         )
         first = output.logits[:, -1, :].argmax(dim=-1).cpu().tolist()
+        self._copy_prefill_cache(output.past_key_values, prompt_length)
+        del output
         self._capture_graphs(batch, prompt_length, capacity)
 
         histories = [list(row) for row in input_ids]
