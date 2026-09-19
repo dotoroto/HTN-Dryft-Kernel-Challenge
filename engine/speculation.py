@@ -1,6 +1,7 @@
 """CPU-side prompt lookup and speculative bucket selection."""
 
 GRAPH_BUCKETS = (4, 2, 1)
+MIN_SPECULATIVE_BATCH = 8
 
 
 def prompt_lookup(history: list[int], count: int, max_ngram: int = 16):
@@ -33,7 +34,9 @@ def prompt_lookup(history: list[int], count: int, max_ngram: int = 16):
 def make_speculative_inputs(
     histories: list[list[int]], pending: list[int], remaining: int
 ):
-    """Return ``(K, rows)`` for the largest usable 4/2/1 graph bucket."""
+    """Return a K=1 decode below batch eight, otherwise the best bucket."""
+    if len(histories) < MIN_SPECULATIVE_BATCH:
+        return 1, [[token] for token in pending]
     for bucket in GRAPH_BUCKETS:
         if bucket > remaining:
             continue

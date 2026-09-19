@@ -18,17 +18,26 @@ def test_prompt_lookup_prefers_longest_recent_suffix():
 
 
 def test_bucket_selection_requires_proposals_for_whole_batch():
+    histories = [[1, 2, 3, 1]] * 7 + [[7, 8, 7]]
+    pending = [1] * 7 + [7]
     bucket, rows = make_speculative_inputs(
-        [[1, 2, 3, 1], [7, 8, 7]], [1, 7], remaining=4
+        histories, pending, remaining=4
     )
     assert bucket == 2
-    assert rows == [[1, 2], [7, 8]]
+    assert rows == [[1, 2]] * 7 + [[7, 8]]
 
     bucket, rows = make_speculative_inputs(
-        [[1, 2, 3], [7, 8, 9]], [3, 9], remaining=4
+        [[1, 2, 3]] * 7 + [[7, 8, 9]], [3] * 7 + [9], remaining=4
     )
     assert bucket == 1
-    assert rows == [[3], [9]]
+    assert rows == [[3]] * 7 + [[9]]
+
+
+def test_small_batches_never_speculate():
+    histories = [[1, 2, 3, 1]] * 7
+    bucket, rows = make_speculative_inputs(histories, [1] * 7, remaining=4)
+    assert bucket == 1
+    assert rows == [[1]] * 7
 
 
 def test_full_acceptance_emits_proposals_and_bonus():

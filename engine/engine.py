@@ -1,5 +1,8 @@
 """Static-cache Qwen3 engine with exact prompt-lookup speculation."""
 
+import os
+import sys
+import time
 from dataclasses import dataclass
 
 import torch
@@ -7,7 +10,8 @@ from transformers import AutoModelForCausalLM, StaticCache
 
 from kernels.acceptance import argmax_and_accept
 from kernels.gqa import grouped_query_attention
-from speculation import make_speculative_inputs, resolve_verification
+from prefill import PromptCache
+from speculation import MIN_SPECULATIVE_BATCH, make_speculative_inputs, resolve_verification
 
 
 def _rotate_half(value: torch.Tensor) -> torch.Tensor:
@@ -21,6 +25,13 @@ class GraphBucket:
     positions: torch.Tensor
     targets: torch.Tensor
     matches: torch.Tensor
+    graph: torch.cuda.CUDAGraph
+
+
+@dataclass
+class PrefillGraph:
+    input_ids: torch.Tensor
+    targets: torch.Tensor
     graph: torch.cuda.CUDAGraph
 
 
@@ -41,7 +52,10 @@ class Engine:
         self.device = torch.device("cuda:0")
         self.cache = None
         self.graphs = {}
+        self.prefill_graph = None
         self.runtime_shape = None
+        self.profile_ttft = os.environ.get("DRYFT_PROFILE_TTFT") == "1"
+        self.graph_prefill = os.environ.get("DRYFT_PREFILL_GRAPH") == "1"
 
     def _allocate_runtime(self, batch: int, capacity: int) -> None:
         shape = (batch, capacity)
@@ -60,19 +74,40 @@ class Engine:
         )
         self.runtime_shape = shape
 
-    def _copy_prefill_cache(self, prefill_cache, prompt_length: int) -> None:
-        """Move native prefill's K/V into the fixed-address decode cache.
+    @torch.inference_mode()
+    def _prefill_to_cache(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Native full-prompt forward with K/V written into decode buffers."""
+        base = self.model.model
+        length = input_ids.shape[1]
+        cache_position = torch.arange(length, device=self.device)
+        position_ids = cache_position.unsqueeze(0)
+        hidden = base.embed_tokens(input_ids)
+        embeddings = base.rotary_emb(hidden, position_ids)
+        cache = PromptCache(self.cache)
+        for layer in base.layers:
+            hidden = layer(
+                hidden,
+                attention_mask=None,
+                position_ids=position_ids,
+                past_key_value=cache,
+                use_cache=True,
+                cache_position=cache_position,
+                position_embeddings=embeddings,
+            )[0]
+        hidden = base.norm(hidden)
+        return self.model.lm_head(hidden[:, -1:, :])
 
-        Prefilling directly into ``StaticCache`` makes Transformers construct
-        a full-capacity causal mask for every layer. A fresh DynamicCache lets
-        the native SDPA prefill use its fast causal path; only the populated
-        prompt slots are copied, and decode still uses the captured static
-        cache addresses.
-        """
-        for destination, source in zip(self.cache.key_cache, prefill_cache.key_cache):
-            destination[:, :, :prompt_length, :].copy_(source)
-        for destination, source in zip(self.cache.value_cache, prefill_cache.value_cache):
-            destination[:, :, :prompt_length, :].copy_(source)
+    def _capture_prefill_graph(self, input_ids: torch.Tensor) -> None:
+        if not self.graph_prefill or self.prefill_graph is not None:
+            return
+        stable_input = input_ids.clone()
+        for _ in range(2):
+            self._prefill_to_cache(stable_input)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            targets = self._prefill_to_cache(stable_input)[:, -1, :].argmax(dim=-1)
+        self.prefill_graph = PrefillGraph(stable_input, targets, graph)
 
     @torch.inference_mode()
     def _target_forward(
@@ -131,7 +166,8 @@ class Engine:
     def _capture_graphs(self, batch: int, prompt_length: int, capacity: int) -> None:
         if self.graphs:
             return
-        for query_length in (1, 2, 4):
+        query_lengths = (1,) if batch < MIN_SPECULATIVE_BATCH else (1, 2, 4)
+        for query_length in query_lengths:
             if prompt_length + query_length > capacity:
                 continue
             input_ids = torch.zeros(
@@ -182,16 +218,39 @@ class Engine:
         capacity = prompt_length + max_new_tokens
         self._allocate_runtime(batch, capacity)
 
-        prompt = torch.tensor(input_ids, dtype=torch.int64, device=self.device)
-        output = self.model(
-            input_ids=prompt,
-            use_cache=True,
-            logits_to_keep=1,
-            return_dict=True,
+        started = time.perf_counter() if self.profile_ttft else None
+        events = (
+            [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+            if self.profile_ttft else None
         )
-        first = output.logits[:, -1, :].argmax(dim=-1).cpu().tolist()
-        self._copy_prefill_cache(output.past_key_values, prompt_length)
-        del output
+        if events:
+            events[0].record()
+        prompt = torch.tensor(input_ids, dtype=torch.int64, device=self.device)
+        if events:
+            events[1].record()
+        if self.prefill_graph is None:
+            first_device = self._prefill_to_cache(prompt)[:, -1, :].argmax(dim=-1)
+        else:
+            self.prefill_graph.input_ids.copy_(prompt)
+            self.prefill_graph.graph.replay()
+            first_device = self.prefill_graph.targets
+        if events:
+            events[2].record()
+        first = first_device.cpu().tolist()
+        if events:
+            events[3].record()
+            events[3].synchronize()
+            print(
+                "ttft_profile"
+                f" batch={batch} prompt={prompt_length}"
+                f" transfer_ms={events[0].elapsed_time(events[1]):.3f}"
+                f" prefill_ms={events[1].elapsed_time(events[2]):.3f}"
+                f" output_ms={events[2].elapsed_time(events[3]):.3f}"
+                f" elapsed_ms={(time.perf_counter() - started) * 1000:.3f}",
+                file=sys.stderr,
+                flush=True,
+            )
+        self._capture_prefill_graph(prompt)
         self._capture_graphs(batch, prompt_length, capacity)
 
         histories = [list(row) for row in input_ids]
