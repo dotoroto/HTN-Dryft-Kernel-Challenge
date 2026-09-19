@@ -10,6 +10,7 @@ from transformers import AutoModelForCausalLM, StaticCache
 
 from kernels.acceptance import argmax_and_accept
 from kernels.gqa import grouped_query_attention
+from kernels.rmsnorm import rms_norm_decode
 from prefill import PromptCache
 from speculation import MIN_SPECULATIVE_BATCH, make_speculative_inputs, resolve_verification
 
@@ -127,7 +128,11 @@ class Engine:
 
         for layer_index, layer in enumerate(base.layers):
             residual = hidden
-            normalized = layer.input_layernorm(hidden)
+            normalized = rms_norm_decode(
+                hidden,
+                layer.input_layernorm.weight,
+                layer.input_layernorm.variance_epsilon,
+            )
             attention = layer.self_attn
             query = attention.q_proj(normalized).view(
                 batch, query_length, query_heads, head_dim
@@ -155,9 +160,17 @@ class Engine:
             )
             hidden = residual + attention.o_proj(attended)
             residual = hidden
-            hidden = residual + layer.mlp(layer.post_attention_layernorm(hidden))
+            hidden = residual + layer.mlp(
+                rms_norm_decode(
+                    hidden,
+                    layer.post_attention_layernorm.weight,
+                    layer.post_attention_layernorm.variance_epsilon,
+                )
+            )
 
-        hidden = base.norm(hidden)
+        hidden = rms_norm_decode(
+            hidden, base.norm.weight, base.norm.variance_epsilon
+        )
         return self.model.lm_head(hidden)
 
     def _verify(self, input_ids: torch.Tensor, positions: torch.Tensor):

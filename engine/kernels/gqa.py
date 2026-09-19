@@ -38,7 +38,10 @@ def _gqa_kernel(
     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), tl.float32)
     log2e = 1.4426950408889634
 
-    for block_start in range(0, CAPACITY, BLOCK_N):
+    # The last query has the greatest absolute position; later cache slots
+    # are not visible to any row in this query block.
+    last_position = tl.load(positions_ptr + Q_LEN - 1)
+    for block_start in range(0, last_position + 1, BLOCK_N):
         keys = block_start + tl.arange(0, BLOCK_N)
         k_offsets = (
             batch * stride_kb + kv_head * stride_kh
