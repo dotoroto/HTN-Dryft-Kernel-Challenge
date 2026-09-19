@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from shape_policy import gqa_block_size
+
 
 @triton.jit
 def _gqa_kernel(
@@ -85,12 +87,13 @@ def grouped_query_attention(query, key_cache, value_cache, positions, scale):
         raise ValueError("GQA expects Q in {1,2,4} and head width 128")
     groups = query_heads // kv_heads
     output = torch.empty_like(query)
+    block_n = gqa_block_size(capacity, query_length)
     _gqa_kernel[(batch, kv_heads)](
         query, key_cache, value_cache, positions, output,
         *query.stride(), *key_cache.stride(), *value_cache.stride(),
         *output.stride(), SCALE=scale, CAPACITY=capacity,
         Q_LEN=query_length, GROUPS=groups, HEAD_DIM=head_dim,
-        BLOCK_N=64, BLOCK_M=16,
+        BLOCK_N=block_n, BLOCK_M=16,
         num_warps=4, num_stages=2,
     )
     return output

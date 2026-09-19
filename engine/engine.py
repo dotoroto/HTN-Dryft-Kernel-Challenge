@@ -11,6 +11,7 @@ from transformers import AutoModelForCausalLM, StaticCache
 from kernels.acceptance import argmax_and_accept
 from kernels.gqa import grouped_query_attention
 from prefill import PromptCache
+from shape_policy import capture_prefill_graph
 from speculation import MIN_SPECULATIVE_BATCH, make_speculative_inputs, resolve_verification
 
 
@@ -55,7 +56,8 @@ class Engine:
         self.prefill_graph = None
         self.runtime_shape = None
         self.profile_ttft = os.environ.get("DRYFT_PROFILE_TTFT") == "1"
-        self.graph_prefill = os.environ.get("DRYFT_PREFILL_GRAPH") == "1"
+        self.prefill_graph_mode = os.environ.get("DRYFT_PREFILL_GRAPH", "auto")
+        self.graph_prefill = False
 
     def _allocate_runtime(self, batch: int, capacity: int) -> None:
         shape = (batch, capacity)
@@ -217,6 +219,9 @@ class Engine:
         prompt_length = len(input_ids[0])
         capacity = prompt_length + max_new_tokens
         self._allocate_runtime(batch, capacity)
+        self.graph_prefill = capture_prefill_graph(
+            batch, prompt_length, max_new_tokens, self.prefill_graph_mode
+        )
 
         started = time.perf_counter() if self.profile_ttft else None
         events = (
